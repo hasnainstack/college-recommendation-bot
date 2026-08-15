@@ -10,14 +10,14 @@ import os
 import json
 import re
 import logging
+import time
 from datetime import datetime
-from functools import lru_cache
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("university_comparison_bot")
 
 # ── Gemini setup ─────────────────────────────────────────────────────────────
@@ -29,12 +29,27 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 GENERATION_CONFIG = types.GenerateContentConfig(
-    max_output_tokens=2048,
-    temperature=0.3,
+    max_output_tokens=1200,
+    temperature=0.2,
 )
+
+REDDIT_FETCH_TIMEOUT = 8  # seconds per subreddit search
+POST_CHAR_LIMIT = 300      # truncate each Reddit post before caching
+
+# Unis the model knows well — skip Reddit entirely for these
+KNOWN_UNIS = {
+    "nust", "lums", "fast", "fast-nuces", "giki", "itu", "comsats",
+    "pucit", "uet", "air university", "bahria", "iba", "nbs", "iobm",
+    "lse", "punjab university", "karachi university", "gcu", "qau",
+    "kinnaird", "forman", "nca", "bnu", "fjwu", "iqra", "ucp",
+}
+
+def _is_known_uni(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in KNOWN_UNIS)
 
 # ── Reddit setup ─────────────────────────────────────────────────────────────
 
@@ -112,27 +127,49 @@ class CompareRequest(BaseModel):
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
-def _fetch_sub(sub: str, university_name: str, limit: int) -> list[str]:
-    posts = []
+def _search_subreddit(sub: str, university_name: str, limit: int) -> list[str]:
+    posts: list[str] = []
     try:
-        for post in reddit.subreddit(sub).search(university_name, sort="relevance", limit=limit):
-            text = (post.title + " " + (post.selftext or "")).strip()
+        for post in reddit.subreddit(sub).search(
+            university_name, sort="relevance", limit=limit
+        ):
+            text = (post.title + " " + (post.selftext or "")).strip()[:POST_CHAR_LIMIT]
             if text:
                 posts.append(text)
-    except Exception as e:
+    except (prawcore_exceptions.PrawcoreException,
+            prawcore_exceptions.NotFound,
+            prawcore_exceptions.Forbidden) as e:
         logger.warning("Reddit fetch failed for r/%s (%s): %s", sub, university_name, e)
+    except Exception as e:
+        logger.warning("Unexpected error fetching r/%s (%s): %s", sub, university_name, e)
     return posts
 
 
-@lru_cache(maxsize=128)
-def fetch_reviews_cached(university_name: str, limit: int = 5) -> tuple[str, ...]:
+_reddit_cache: dict[str, tuple[str, ...]] = {}
+
+def fetch_reviews_cached(university_name: str, limit: int = 10) -> tuple[str, ...]:
+    if university_name in _reddit_cache:
+        return _reddit_cache[university_name]
+    if _is_known_uni(university_name):
+        logger.info("[%s] Skipping Reddit (known uni — using model knowledge)", university_name)
+        _reddit_cache[university_name] = ()
+        return ()
     subs = ["pakistan", "islamabad", "college", university_name.replace(" ", "")]
     posts: list[str] = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_fetch_sub, sub, university_name, limit): sub for sub in subs}
-        for future in as_completed(futures):
-            posts.extend(future.result())
-    return tuple(posts[:20])
+    with ThreadPoolExecutor(max_workers=len(subs)) as executor:
+        futures = {
+            executor.submit(_search_subreddit, sub, university_name, limit): sub
+            for sub in subs
+        }
+        for future in as_completed(futures, timeout=REDDIT_FETCH_TIMEOUT * len(subs)):
+            sub = futures[future]
+            try:
+                posts.extend(future.result(timeout=REDDIT_FETCH_TIMEOUT))
+            except Exception as e:
+                logger.warning("Timed out / failed collecting r/%s (%s): %s", sub, university_name, e)
+    result = tuple(posts[:20])
+    _reddit_cache[university_name] = result
+    return result
 
 
 def build_prompt(uni1: str, reviews1: list[str], uni2: Optional[str],
@@ -144,25 +181,17 @@ def build_prompt(uni1: str, reviews1: list[str], uni2: Optional[str],
             f"{k}: {v}" for k, v in filter_dict.items() if v
         )
 
-    r1 = "\n".join(reviews1[:10]) or "No Reddit data found."
-    base = f"""
-You are an AI university analyst. Analyze the Reddit student discussions below and
-return ONLY a valid JSON object — no markdown fences, no extra text.
-
-{prefs}
-
-University 1: {uni1}
-Reddit discussions:
-{r1}
-"""
-    if uni2 and reviews2:
-        r2 = "\n".join(reviews2[:10]) or "No Reddit data found."
+    r1 = "\n".join(reviews1[:10])
+    src1 = f"{uni1} Reddit posts:\n{r1}" if r1 else f"{uni1}: use your training knowledge."
+    base = f"""Return ONLY valid JSON, no markdown. {prefs}
+{src1}"""
+    if uni2:
+        r2 = "\n".join(reviews2[:10])
+        src2 = f"{uni2} Reddit posts:\n{r2}" if r2 else f"{uni2}: use your training knowledge."
+        base += f"\n{src2}"
         base += f"""
-University 2: {uni2}
-Reddit discussions:
-{r2}
 
-Return this exact JSON structure:
+Return JSON:
 {{
   "mode": "compare",
   "universities": [
@@ -215,11 +244,10 @@ Return this exact JSON structure:
   "confidence": "low | medium | high",
   "posts_analyzed": <number>,
   "data_date": "{datetime.now().strftime('%Y-%m-%d')}"
-}}
-"""
+}}"""
     else:
         base += f"""
-Return this exact JSON structure:
+Return JSON:
 {{
   "mode": "single",
   "universities": [
@@ -247,18 +275,29 @@ Return this exact JSON structure:
   "confidence": "low | medium | high",
   "posts_analyzed": <number>,
   "data_date": "{datetime.now().strftime('%Y-%m-%d')}"
-}}
-"""
+}}"""
     return base
 
 
 def parse_response(text: str) -> dict | None:
-    try:
-        cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
-        return json.loads(cleaned)
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.warning("Failed to parse Gemini response as JSON: %s", e)
+    if not text:
         return None
+    # 1. strip markdown fences
+    cleaned = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
+    # 2. try direct parse
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # 3. extract outermost {...} block
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+    logger.warning("Failed to parse model response as JSON. Raw: %s", text[:300])
+    return None
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -281,24 +320,40 @@ def get_static():
 
 
 @app.post("/api/compare")
-async def compare(req: CompareRequest):
+def compare(req: CompareRequest):
     if not req.uni1.strip():
         raise HTTPException(status_code=422, detail="uni1 is required.")
     if req.uni2 is not None and not req.uni2.strip():
         raise HTTPException(status_code=422, detail="uni2 cannot be empty when provided.")
 
+    req_label = f"{req.uni1}" + (f" vs {req.uni2}" if req.uni2 else "")
+
+    # ── Stage 1: Reddit fetch ────────────────────────────────────────────────
+    t0 = time.perf_counter()
     try:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f1 = ex.submit(fetch_reviews_cached, req.uni1.strip())
-            f2 = ex.submit(fetch_reviews_cached, req.uni2.strip()) if req.uni2 else None
-            reviews1 = list(f1.result())
-            reviews2 = list(f2.result()) if f2 else []
+        if req.uni2:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future1 = executor.submit(fetch_reviews_cached, req.uni1.strip())
+                future2 = executor.submit(fetch_reviews_cached, req.uni2.strip())
+                reviews1 = list(future1.result())
+                reviews2 = list(future2.result())
+        else:
+            reviews1 = list(fetch_reviews_cached(req.uni1.strip()))
+            reviews2 = []
     except prawcore_exceptions.PrawcoreException as e:
         logger.error("Reddit API error: %s", e)
         raise HTTPException(status_code=503, detail=f"Reddit is temporarily unavailable: {e}")
+    t1 = time.perf_counter()
+    logger.info("[%s] Reddit fetch: %.0fms (%d posts)", req_label, (t1 - t0) * 1000, len(reviews1) + len(reviews2))
 
+    # ── Stage 2: Prompt build ────────────────────────────────────────────────
+    t2 = time.perf_counter()
     prompt = build_prompt(req.uni1, reviews1, req.uni2, reviews2, req.filters)
+    t3 = time.perf_counter()
+    logger.info("[%s] Prompt build: %.0fms (%d chars)", req_label, (t3 - t2) * 1000, len(prompt))
 
+    # ── Stage 3: Gemini call ─────────────────────────────────────────────────
+    t4 = time.perf_counter()
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -312,6 +367,9 @@ async def compare(req: CompareRequest):
     except ValueError as e:
         logger.error("Gemini response unusable: %s", e)
         raise HTTPException(status_code=503, detail="AI returned no usable response.")
+    t5 = time.perf_counter()
+    logger.info("[%s] Gemini call: %.0fms (%d chars out)", req_label, (t5 - t4) * 1000, len(raw or ""))
+    logger.info("[%s] Total: %.0fms", req_label, (t5 - t0) * 1000)
 
     if not raw:
         raise HTTPException(status_code=502, detail="AI returned an empty response.")
