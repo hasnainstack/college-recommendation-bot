@@ -13,7 +13,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -166,10 +166,13 @@ class CompareRequest(BaseModel):
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
-def _search_subreddit(sub: str, university_name: str, limit: int) -> list[dict]:
+def _search_reddit_all(university_name: str, limit: int) -> list[dict]:
+    """Search across all of Reddit instead of a fixed subreddit list — Reddit's
+    own relevance ranking finds the right posts wherever they actually live,
+    instead of us guessing which subreddits might have them."""
     posts: list[dict] = []
     try:
-        for post in reddit.subreddit(sub).search(
+        for post in reddit.subreddit("all").search(
             university_name, sort="relevance", limit=limit
         ):
             text = (post.title + " " + (post.selftext or "")).strip()[:POST_CHAR_LIMIT]
@@ -178,44 +181,35 @@ def _search_subreddit(sub: str, university_name: str, limit: int) -> list[dict]:
                     "text": text,
                     "title": post.title,
                     "url": f"https://reddit.com{post.permalink}",
-                    "subreddit": sub,
+                    "subreddit": str(post.subreddit),
                 })
     except (prawcore_exceptions.PrawcoreException,
             prawcore_exceptions.NotFound,
             prawcore_exceptions.Forbidden) as e:
-        logger.warning("Reddit fetch failed for r/%s (%s): %s", sub, university_name, e)
+        logger.warning("Reddit search failed (%s): %s", university_name, e)
     except Exception as e:
-        logger.warning("Unexpected error fetching r/%s (%s): %s", sub, university_name, e)
+        logger.warning("Unexpected error searching Reddit (%s): %s", university_name, e)
     return posts
 
 
 _reddit_cache: dict[str, tuple[dict, ...]] = {}
 
-def fetch_reviews_cached(university_name: str, limit: int = 10) -> tuple[dict, ...]:
+def fetch_reviews_cached(university_name: str, limit: int = 20) -> tuple[dict, ...]:
     if university_name in _reddit_cache:
         return _reddit_cache[university_name]
     if _should_skip_reddit(university_name):
         logger.info("[%s] Skipping Reddit (famous, or learned to be sparse — using model knowledge)", university_name)
         _reddit_cache[university_name] = ()
         return ()
-    subs = ["pakistan", "islamabad", "college", university_name.replace(" ", "")]
     posts: list[dict] = []
-    with ThreadPoolExecutor(max_workers=len(subs)) as executor:
-        futures = {
-            executor.submit(_search_subreddit, sub, university_name, limit): sub
-            for sub in subs
-        }
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_search_reddit_all, university_name, limit)
         try:
-            for future in as_completed(futures, timeout=REDDIT_FETCH_TIMEOUT + 1):
-                sub = futures[future]
-                try:
-                    posts.extend(future.result(timeout=0))
-                except Exception as e:
-                    logger.warning("Failed collecting r/%s (%s): %s", sub, university_name, e)
+            posts = future.result(timeout=REDDIT_FETCH_TIMEOUT)
         except TimeoutError:
-            # Some subreddit searches didn't finish in time — use whatever
-            # results came back and move on instead of blocking further.
-            logger.warning("[%s] Reddit fetch hit overall timeout, using partial results", university_name)
+            logger.warning("[%s] Reddit search hit timeout, no results", university_name)
+        except Exception as e:
+            logger.warning("[%s] Reddit search failed: %s", university_name, e)
     result = tuple(posts[:20])
     _record_reddit_yield(university_name, len(result))
     _reddit_cache[university_name] = result
