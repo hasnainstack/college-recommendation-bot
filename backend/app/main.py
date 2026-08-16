@@ -29,27 +29,17 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 
 GENERATION_CONFIG = types.GenerateContentConfig(
-    max_output_tokens=1200,
+    max_output_tokens=2500,
     temperature=0.2,
 )
 
-REDDIT_FETCH_TIMEOUT = 8  # seconds per subreddit search
+REDDIT_FETCH_TIMEOUT = 4  # seconds per subreddit search
 POST_CHAR_LIMIT = 300      # truncate each Reddit post before caching
-
-# Unis the model knows well — skip Reddit entirely for these
-KNOWN_UNIS = {
-    "nust", "lums", "fast", "fast-nuces", "giki", "itu", "comsats",
-    "pucit", "uet", "air university", "bahria", "iba", "nbs", "iobm",
-    "lse", "punjab university", "karachi university", "gcu", "qau",
-    "kinnaird", "forman", "nca", "bnu", "fjwu", "iqra", "ucp",
-}
-
-def _is_known_uni(name: str) -> bool:
-    n = name.lower()
-    return any(k in n for k in KNOWN_UNIS)
+MIN_POSTS_TO_TRUST_REDDIT = 3   # below this, treat the uni as "Reddit-sparse"
+SPARSE_STREAK_TO_SKIP = 2        # consecutive sparse results before we stop trying
 
 # ── Reddit setup ─────────────────────────────────────────────────────────────
 
@@ -110,6 +100,55 @@ POPULAR_PK_COMPARISONS = [
     "Punjab University vs Karachi University",
 ]
 
+
+# ── Self-learning Reddit-yield cache ──────────────────────────────────────────
+# No hardcoded university list. Every university is tried on Reddit the same
+# way. We track how many posts actually came back each time, and once a
+# university has proven sparse (few/no posts) several times in a row, we
+# stop bothering to fetch for it and let the model answer from its own
+# knowledge instead. This state is persisted to disk so what it "learns"
+# survives server restarts instead of resetting every deploy.
+
+_YIELD_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "reddit_yield_history.json")
+
+def _load_yield_history() -> dict[str, dict]:
+    try:
+        with open(_YIELD_HISTORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_yield_history() -> None:
+    try:
+        with open(_YIELD_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(_reddit_yield_history, f, indent=2)
+    except OSError as e:
+        logger.warning("Failed to persist Reddit yield history: %s", e)
+
+
+# uni_name -> {"sparse_streak": int, "skip": bool}
+_reddit_yield_history: dict[str, dict] = _load_yield_history()
+
+def _should_skip_reddit(name: str) -> bool:
+    n = name.lower().strip()
+    history = _reddit_yield_history.get(n)
+    return bool(history and history.get("skip"))
+
+
+def _record_reddit_yield(name: str, post_count: int) -> None:
+    n = name.lower().strip()
+    history = _reddit_yield_history.setdefault(n, {"sparse_streak": 0, "skip": False})
+    if post_count < MIN_POSTS_TO_TRUST_REDDIT:
+        history["sparse_streak"] += 1
+        if history["sparse_streak"] >= SPARSE_STREAK_TO_SKIP:
+            history["skip"] = True
+            logger.info("[%s] Learned to skip Reddit (sparse %d times in a row)",
+                        name, history["sparse_streak"])
+    else:
+        history["sparse_streak"] = 0
+        history["skip"] = False
+    _save_yield_history()
+
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class Filters(BaseModel):
@@ -127,15 +166,20 @@ class CompareRequest(BaseModel):
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
-def _search_subreddit(sub: str, university_name: str, limit: int) -> list[str]:
-    posts: list[str] = []
+def _search_subreddit(sub: str, university_name: str, limit: int) -> list[dict]:
+    posts: list[dict] = []
     try:
         for post in reddit.subreddit(sub).search(
             university_name, sort="relevance", limit=limit
         ):
             text = (post.title + " " + (post.selftext or "")).strip()[:POST_CHAR_LIMIT]
             if text:
-                posts.append(text)
+                posts.append({
+                    "text": text,
+                    "title": post.title,
+                    "url": f"https://reddit.com{post.permalink}",
+                    "subreddit": sub,
+                })
     except (prawcore_exceptions.PrawcoreException,
             prawcore_exceptions.NotFound,
             prawcore_exceptions.Forbidden) as e:
@@ -145,35 +189,41 @@ def _search_subreddit(sub: str, university_name: str, limit: int) -> list[str]:
     return posts
 
 
-_reddit_cache: dict[str, tuple[str, ...]] = {}
+_reddit_cache: dict[str, tuple[dict, ...]] = {}
 
-def fetch_reviews_cached(university_name: str, limit: int = 10) -> tuple[str, ...]:
+def fetch_reviews_cached(university_name: str, limit: int = 10) -> tuple[dict, ...]:
     if university_name in _reddit_cache:
         return _reddit_cache[university_name]
-    if _is_known_uni(university_name):
-        logger.info("[%s] Skipping Reddit (known uni — using model knowledge)", university_name)
+    if _should_skip_reddit(university_name):
+        logger.info("[%s] Skipping Reddit (famous, or learned to be sparse — using model knowledge)", university_name)
         _reddit_cache[university_name] = ()
         return ()
     subs = ["pakistan", "islamabad", "college", university_name.replace(" ", "")]
-    posts: list[str] = []
+    posts: list[dict] = []
     with ThreadPoolExecutor(max_workers=len(subs)) as executor:
         futures = {
             executor.submit(_search_subreddit, sub, university_name, limit): sub
             for sub in subs
         }
-        for future in as_completed(futures, timeout=REDDIT_FETCH_TIMEOUT * len(subs)):
-            sub = futures[future]
-            try:
-                posts.extend(future.result(timeout=REDDIT_FETCH_TIMEOUT))
-            except Exception as e:
-                logger.warning("Timed out / failed collecting r/%s (%s): %s", sub, university_name, e)
+        try:
+            for future in as_completed(futures, timeout=REDDIT_FETCH_TIMEOUT + 1):
+                sub = futures[future]
+                try:
+                    posts.extend(future.result(timeout=0))
+                except Exception as e:
+                    logger.warning("Failed collecting r/%s (%s): %s", sub, university_name, e)
+        except TimeoutError:
+            # Some subreddit searches didn't finish in time — use whatever
+            # results came back and move on instead of blocking further.
+            logger.warning("[%s] Reddit fetch hit overall timeout, using partial results", university_name)
     result = tuple(posts[:20])
+    _record_reddit_yield(university_name, len(result))
     _reddit_cache[university_name] = result
     return result
 
 
-def build_prompt(uni1: str, reviews1: list[str], uni2: Optional[str],
-                 reviews2: list[str], filters: Filters) -> str:
+def build_prompt(uni1: str, reviews1: list[dict], uni2: Optional[str],
+                 reviews2: list[dict], filters: Filters) -> str:
     prefs = ""
     filter_dict = filters.model_dump()
     if any(filter_dict.values()):
@@ -181,12 +231,12 @@ def build_prompt(uni1: str, reviews1: list[str], uni2: Optional[str],
             f"{k}: {v}" for k, v in filter_dict.items() if v
         )
 
-    r1 = "\n".join(reviews1[:10])
+    r1 = "\n".join(p["text"] for p in reviews1[:10])
     src1 = f"{uni1} Reddit posts:\n{r1}" if r1 else f"{uni1}: use your training knowledge."
     base = f"""Return ONLY valid JSON, no markdown. {prefs}
 {src1}"""
     if uni2:
-        r2 = "\n".join(reviews2[:10])
+        r2 = "\n".join(p["text"] for p in reviews2[:10])
         src2 = f"{uni2} Reddit posts:\n{r2}" if r2 else f"{uni2}: use your training knowledge."
         base += f"\n{src2}"
         base += f"""
@@ -280,24 +330,22 @@ Return JSON:
 
 
 def parse_response(text: str) -> dict | None:
-    if not text:
-        return None
-    # 1. strip markdown fences
-    cleaned = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
-    # 2. try direct parse
+    cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    # 3. extract outermost {...} block
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            pass
-    logger.warning("Failed to parse model response as JSON. Raw: %s", text[:300])
-    return None
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning("Failed to parse model response as JSON: %s", e)
+        # Fallback: model may have added stray text before/after the JSON,
+        # or the JSON got cut off mid-generation. Try to pull out the
+        # outermost {...} block and parse that instead of giving up.
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError as e2:
+                logger.warning("Fallback JSON extraction also failed: %s", e2)
+        logger.warning("Raw model output that failed to parse:\n%s", cleaned[:3000])
+        return None
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
@@ -379,4 +427,19 @@ def compare(req: CompareRequest):
         raise HTTPException(status_code=502, detail="AI returned an unexpected format.")
 
     data["posts_analyzed"] = data.get("posts_analyzed", len(reviews1) + len(reviews2))
+
+    # Attach real Reddit sources ourselves — never let the model generate
+    # URLs, since it can hallucinate plausible-looking but fake links.
+    seen_urls = set()
+    sources = []
+    for post in list(reviews1) + list(reviews2):
+        if post["url"] not in seen_urls:
+            seen_urls.add(post["url"])
+            sources.append({
+                "title": post["title"],
+                "url": post["url"],
+                "subreddit": post["subreddit"],
+            })
+    data["reddit_sources"] = sources
+
     return data
