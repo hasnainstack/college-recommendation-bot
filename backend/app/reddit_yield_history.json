@@ -18,5 +18,17 @@
   "harvard university": {
     "sparse_streak": 0,
     "skip": false
+  },
+  "fast": {
+    "sparse_streak": 2,
+    "skip": true
+  },
+  "nust": {
+    "sparse_streak": 0,
+    "skip": false
+  },
+  "asldjadfo": {
+    "sparse_streak": 1,
+    "skip": false
   }
 }

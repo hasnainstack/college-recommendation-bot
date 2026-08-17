@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from groq import Groq
 import praw
 import prawcore.exceptions as prawcore_exceptions
 import os
@@ -35,6 +36,15 @@ GENERATION_CONFIG = types.GenerateContentConfig(
     max_output_tokens=2500,
     temperature=0.2,
 )
+
+# ── Groq setup (fallback when Gemini is unavailable) ─────────────────────────
+
+groq_api_key = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
+
+GROQ_MODEL = "openai/gpt-oss-120b"  # Groq's current recommended general-purpose model
+GROQ_MAX_TOKENS = 2500
+GROQ_TEMPERATURE = 0.2
 
 REDDIT_FETCH_TIMEOUT = 4  # seconds per subreddit search
 POST_CHAR_LIMIT = 300      # truncate each Reddit post before caching
@@ -341,6 +351,59 @@ def parse_response(text: str) -> dict | None:
         logger.warning("Raw model output that failed to parse:\n%s", cleaned[:3000])
         return None
 
+
+def call_gemini(prompt: str) -> str:
+    """Primary generator."""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=GENERATION_CONFIG,
+    )
+    raw = response.text
+    if not raw:
+        raise ValueError("Gemini returned an empty response.")
+    return raw
+
+
+def call_groq(prompt: str) -> str:
+    """Fallback generator, used automatically whenever Gemini fails."""
+    if not groq_client:
+        raise RuntimeError("GROQ_API_KEY not configured — no fallback available.")
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": "Return ONLY valid JSON, no markdown, no commentary."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=GROQ_TEMPERATURE,
+        max_tokens=GROQ_MAX_TOKENS,
+        response_format={"type": "json_object"},
+    )
+    raw = completion.choices[0].message.content
+    if not raw:
+        raise ValueError("Groq returned an empty response.")
+    return raw
+
+
+def generate_with_fallback(prompt: str, req_label: str) -> tuple[str, str]:
+    """Try Gemini first; on any failure, automatically fall back to Groq.
+    Returns (raw_text, model_used)."""
+    try:
+        raw = call_gemini(prompt)
+        return raw, GEMINI_MODEL
+    except Exception as gemini_error:
+        logger.warning("[%s] Gemini failed (%s) — falling back to Groq (%s)",
+                        req_label, gemini_error, GROQ_MODEL)
+        try:
+            raw = call_groq(prompt)
+            return raw, GROQ_MODEL
+        except Exception as groq_error:
+            logger.error("[%s] Groq fallback also failed: %s", req_label, groq_error)
+            raise HTTPException(
+                status_code=503,
+                detail=f"AI service unavailable — Gemini failed ({gemini_error}) and Groq fallback also failed ({groq_error}).",
+            )
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="University Comparison API")
@@ -394,23 +457,11 @@ def compare(req: CompareRequest):
     t3 = time.perf_counter()
     logger.info("[%s] Prompt build: %.0fms (%d chars)", req_label, (t3 - t2) * 1000, len(prompt))
 
-    # ── Stage 3: Gemini call ─────────────────────────────────────────────────
+    # ── Stage 3: Gemini call, with automatic Groq fallback ──────────────────
     t4 = time.perf_counter()
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=GENERATION_CONFIG,
-        )
-        raw = response.text
-    except genai.errors.APIError as e:
-        logger.error("Gemini API error: %s", e)
-        raise HTTPException(status_code=503, detail=f"AI service error: {e}")
-    except ValueError as e:
-        logger.error("Gemini response unusable: %s", e)
-        raise HTTPException(status_code=503, detail="AI returned no usable response.")
+    raw, model_used = generate_with_fallback(prompt, req_label)
     t5 = time.perf_counter()
-    logger.info("[%s] Gemini call: %.0fms (%d chars out)", req_label, (t5 - t4) * 1000, len(raw or ""))
+    logger.info("[%s] %s call: %.0fms (%d chars out)", req_label, model_used, (t5 - t4) * 1000, len(raw or ""))
     logger.info("[%s] Total: %.0fms", req_label, (t5 - t0) * 1000)
 
     if not raw:
@@ -421,6 +472,7 @@ def compare(req: CompareRequest):
         raise HTTPException(status_code=502, detail="AI returned an unexpected format.")
 
     data["posts_analyzed"] = data.get("posts_analyzed", len(reviews1) + len(reviews2))
+    data["model_used"] = model_used  # lets the frontend show which engine actually answered
 
     # Attach real Reddit sources ourselves — never let the model generate
     # URLs, since it can hallucinate plausible-looking but fake links.
