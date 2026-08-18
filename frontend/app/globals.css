@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+}
