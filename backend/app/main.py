@@ -64,7 +64,7 @@ reddit = praw.Reddit(
 # ── Static data ───────────────────────────────────────────────────────────────
 
 FAMOUS_UNIS_PK = {
-    "💻 Best for Computer Science": [
+    "Best for Computer Science": [
         "NUST — National University of Sciences & Technology, Islamabad",
         "LUMS — Lahore University of Management Sciences (SBASSE)",
         "FAST-NUCES — National University of Computer & Emerging Sciences",
@@ -76,7 +76,7 @@ FAMOUS_UNIS_PK = {
         "Air University, Islamabad",
         "Bahria University, Islamabad",
     ],
-    "💼 Best for BBA / Business": [
+    "Best for BBA / Business": [
         "LUMS — Suleman Dawood School of Business",
         "IBA Karachi — Institute of Business Administration",
         "NBS — NUST Business School, Islamabad",
@@ -88,7 +88,7 @@ FAMOUS_UNIS_PK = {
         "UCP — University of Central Punjab, CBM",
         "Iqra University, Karachi",
     ],
-    "🎨 Best for Arts / Humanities & Social Sciences": [
+    "Best for Arts / Humanities & Social Sciences": [
         "University of the Punjab, Lahore",
         "University of Karachi",
         "GCU — Government College University, Lahore",
